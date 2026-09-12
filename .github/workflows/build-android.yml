@@ -1,0 +1,83 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch: {}     # manual "Run workflow" button only
+
+jobs:
+  apk:
+    name: Android
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          submodules: recursive   # harmless no-op if the repo has none
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # NuGet's own cache action keys off packages.lock.json / *.csproj by
+      # default; doing it explicitly here (same idea as vcpkg's binary
+      # cache) avoids re-downloading the whole package set every run.
+      - name: Restore NuGet cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            nuget-
+
+      - name: Install Android workload
+        run: dotnet workload install android
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v4
+        # Sets ANDROID_HOME and installs platform-tools/build-tools, which
+        # find_android_sdk() in publish_release.py picks up automatically.
+
+      - name: Compute artifact name
+        shell: bash
+        run: |
+          short_sha="$(git rev-parse --short HEAD)"
+          echo "ARTIFACT_NAME=crashbandicoot-${short_sha}-android" >> "$GITHUB_ENV"
+
+      # AndroidRuntimeHost.csproj embeds RecompOne.Runtime's plain net10.0
+      # build output as a raw AndroidAsset file glob (not through its normal
+      # ProjectReference build graph):
+      #   RecompOne.Runtime\bin\$(Configuration)\net10.0\RecompOne.Runtime.dll
+      # MSBuild expands that glob at project-evaluation time, which can run
+      # before anything has actually produced that file. Locally it exists
+      # from an earlier build; on a fresh CI checkout it doesn't yet, so the
+      # first run risks silently shipping without CompilerRefs\RecompOne.Runtime.dll
+      # (no build error -- just a missing on-device Roslyn reference later).
+      # Build it once up front so it's on disk before AndroidRuntimeHost is evaluated.
+      - name: Pre-build RecompOne.Runtime (net10.0)
+        run: dotnet build RecompOne.Runtime/RecompOne.Runtime.csproj -c Release -f net10.0
+
+      # publish_android() always runs the build through the Android signing
+      # properties -- there's no unsigned-build flag in the script. Since
+      # signing/ doesn't exist on a fresh checkout (it's gitignored),
+      # ensure_android_keystore() auto-generates a fresh, throwaway keystore
+      # on the runner for this alone. That's fine here: the resulting
+      # signature is discarded with the runner, and apksigner overwrites it
+      # cleanly when you re-sign the APK yourself with your real key
+      # afterwards -- no need to strip anything first.
+      - name: Build APK
+        run: python3 publish_release.py --platform android --out publish-android
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: publish-android/*.apk
+          if-no-files-found: error
